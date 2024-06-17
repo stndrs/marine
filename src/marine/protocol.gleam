@@ -4,6 +4,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/regex
 import gleam/result
+import marine/server_errors
 import mug.{type Socket}
 
 pub type Handshake {
@@ -53,28 +54,32 @@ pub type Payload {
   Payload(length: Int, sequence_id: Int, body: BitArray)
 }
 
+pub type MarineError {
+  MarineError(code: Int, name: String, message: BitArray)
+}
+
 /// Establish a TCP connection to the database server as specified by the
 /// `Config`. If a connection is established and the initial handshake packet
 /// is parsed successfully, the Socket and Handshake are returned.
-pub fn connect(config: Config) -> Result(#(Socket, Handshake), Nil) {
+pub fn connect(config: Config) -> Result(#(Socket, Handshake), MarineError) {
   let Config(host, port, connect_timeout, receive_timeout) = config
 
   let connect =
     mug.new(host, port: port)
     |> mug.timeout(connect_timeout)
     |> mug.connect
-    |> result.nil_error
+    |> result.replace_error(generic_error())
 
   use socket <- result.try(connect)
 
   socket
   |> mug.receive(receive_timeout)
-  |> result.nil_error
+  |> result.replace_error(generic_error())
   |> result.then(handle_handshake(_))
   |> result.map(fn(handshake) { #(socket, handshake) })
 }
 
-fn handle_handshake(packet: BitArray) -> Result(Handshake, Nil) {
+fn handle_handshake(packet: BitArray) -> Result(Handshake, MarineError) {
   packet
   |> to_payload
   |> result.then(decode_initial_handshake)
@@ -85,24 +90,41 @@ fn handle_handshake(packet: BitArray) -> Result(Handshake, Nil) {
 // Construct a Payload from the packet received. The first 3 bytes (24 bits) indicate
 // the length of the payload. One byte (8 bits) following the first 3 bytes carries
 // the sequence ID. The remaining bits contain the packet payload/body
-fn to_payload(packet: BitArray) -> Result(Payload, Nil) {
+fn to_payload(packet: BitArray) -> Result(Payload, MarineError) {
   case packet {
     <<length:little-size(24), seq_id:little-size(8), rest:bits>> -> {
       Payload(length: length, sequence_id: seq_id, body: rest) |> Ok
     }
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_v10.html
-fn decode_initial_handshake(payload: Payload) -> Result(Handshake, Nil) {
+fn decode_initial_handshake(payload: Payload) -> Result(Handshake, MarineError) {
   case payload.body {
     <<10, rest:bits>> -> decode_handshake_v10(rest)
-    _ -> Error(Nil)
+    <<0xFF, rest:bits>> -> decode_connect_err_packet_body(rest)
+    _ -> Error(generic_error())
   }
 }
 
-fn decode_handshake_v10(body: BitArray) -> Result(Handshake, Nil) {
+fn decode_connect_err_packet_body(
+  body: BitArray,
+) -> Result(Handshake, MarineError) {
+  case body {
+    <<code:unsigned-little-size(16), message:bits>> -> {
+      let name = server_errors.to_name(code)
+      MarineError(code, name, message) |> Error
+    }
+    _ -> Error(generic_error())
+  }
+}
+
+fn generic_error() -> MarineError {
+  MarineError(-1, "generic_error", <<>>)
+}
+
+fn decode_handshake_v10(body: BitArray) -> Result(Handshake, MarineError) {
   use #(server_version, rest) <- result.try(null_terminated_string(body))
 
   case rest {
@@ -133,7 +155,7 @@ fn decode_handshake_v10(body: BitArray) -> Result(Handshake, Nil) {
       |> result.then(ensure_capabilities(_, required_capabilities))
       |> result.then(apply_auth_plugin_info(_, auth_plugin_data1, rest))
     }
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
@@ -141,14 +163,14 @@ fn build_capability_flags(
   handshake: Handshake,
   flags1: BitArray,
   flags2: BitArray,
-) -> Result(Handshake, Nil) {
+) -> Result(Handshake, MarineError) {
   let capability_flags = bit_array.concat([flags1, flags2])
 
   case capability_flags {
     <<capability_flags:unsigned-little-size(32)>> -> {
       Handshake(..handshake, capability_flags: capability_flags) |> Ok
     }
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
@@ -156,7 +178,7 @@ fn build_capability_flags(
 fn ensure_capabilities(
   handshake: Handshake,
   required_capabilities: List(String),
-) -> Result(Handshake, Nil) {
+) -> Result(Handshake, MarineError) {
   required_capabilities
   |> list.try_each(has_capability_flag(handshake, _))
   |> result.map(fn(_) { handshake })
@@ -165,7 +187,7 @@ fn ensure_capabilities(
 fn has_capability_flag(
   handshake: Handshake,
   name: String,
-) -> Result(Handshake, Nil) {
+) -> Result(Handshake, MarineError) {
   all_capability_flags
   |> list.key_find(name)
   |> result.then(fn(value) {
@@ -174,13 +196,14 @@ fn has_capability_flag(
       False -> Error(Nil)
     }
   })
+  |> result.replace_error(generic_error())
 }
 
 fn apply_auth_plugin_info(
   handshake: Handshake,
   auth_plugin_data1: BitArray,
   data: BitArray,
-) -> Result(Handshake, Nil) {
+) -> Result(Handshake, MarineError) {
   case data {
     <<
       auth_plugin_data_length:unsigned-little-int,
@@ -196,7 +219,7 @@ fn apply_auth_plugin_info(
         Handshake(..handshake, auth_plugin_data: data, auth_plugin_name: name)
       })
     }
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
@@ -204,23 +227,28 @@ fn parse_auth_plugin_info(
   data: BitArray,
   auth_plugin_data1: BitArray,
   len: Int,
-) -> Result(#(String, String), Nil) {
+) -> Result(#(String, String), MarineError) {
   case data {
     <<auth_plugin_data2:bits-size(len), auth_plugin_name:bits>> -> {
       let auth_plugin_data = <<auth_plugin_data1:bits, auth_plugin_data2:bits>>
-      use plugin_data <- result.try(bit_array.to_string(auth_plugin_data))
-      use plugin_name <- result.try(bit_array.to_string(auth_plugin_name))
+      let info = {
+        use plugin_data <- result.try(bit_array.to_string(auth_plugin_data))
+        use plugin_name <- result.try(bit_array.to_string(auth_plugin_name))
 
-      Ok(#(plugin_data, plugin_name))
+        Ok(#(plugin_data, plugin_name))
+      }
+      result.replace_error(info, generic_error())
     }
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
-fn null_terminated_string(data: BitArray) -> Result(#(BitArray, BitArray), Nil) {
+fn null_terminated_string(
+  data: BitArray,
+) -> Result(#(BitArray, BitArray), MarineError) {
   case erl_binary_split(data, <<0>>) {
     [string, rest] -> Ok(#(string, rest))
-    _ -> Error(Nil)
+    _ -> Error(generic_error())
   }
 }
 
