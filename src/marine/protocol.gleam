@@ -5,6 +5,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/regex
 import gleam/result
 import gleam/string
+import marine/errors.{type MarineError}
 import marine/flags
 import marine/server_errors
 
@@ -41,15 +42,11 @@ pub type Payload {
   Payload(length: Int, sequence_id: Int, body: BitArray)
 }
 
-pub type ProtocolError {
-  ProtocolError(code: Int, name: String, message: BitArray)
-}
-
 // Connection Phase
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
 
 /// Parse the packet from the initial handshake received from the database server
-pub fn initial_handshake(packet: BitArray) -> Result(Handshake, ProtocolError) {
+pub fn initial_handshake(packet: BitArray) -> Result(Handshake, MarineError) {
   packet
   |> to_payload
   |> result.then(decode_initial_handshake)
@@ -59,7 +56,7 @@ pub fn initial_handshake(packet: BitArray) -> Result(Handshake, ProtocolError) {
 pub fn compile_capability_flags(
   config: Config,
   initial_handshake: Handshake,
-) -> Result(Int, ProtocolError) {
+) -> Result(Int, MarineError) {
   let server_capability_flags = initial_handshake.capability_flags
 
   let client_capability_flags =
@@ -80,7 +77,11 @@ pub fn compile_capability_flags(
 
   case ssl_support_error {
     True ->
-      ProtocolError(code: -1, name: "server_ssl_unsupported", message: <<>>)
+      errors.ProtocolError(
+        code: -1,
+        name: "server_ssl_unsupported",
+        message: <<>>,
+      )
       |> Error
     False ->
       filter_capabilities(server_capability_flags, client_capability_flags)
@@ -111,15 +112,15 @@ fn maybe_add_capability_flags(
   }
 }
 
-// pub fn encode_handshake_response_41() -> Result(Nil, ProtocolError) {
+// pub fn encode_handshake_response_41() -> Result(Nil, MarineError) {
 //   todo
 // }
 // 
-// pub fn encode_ssl_request() -> Result(Nil, ProtocolError) {
+// pub fn encode_ssl_request() -> Result(Nil, MarineError) {
 //   todo
 // }
 // 
-// pub fn decode_auth_response() -> Result(Nil, ProtocolError) {
+// pub fn decode_auth_response() -> Result(Nil, MarineError) {
 //   todo
 // }
 
@@ -128,43 +129,37 @@ fn maybe_add_capability_flags(
 // Construct a Payload from the packet received. The first 3 bytes (24 bits) indicate
 // the length of the payload. One byte (8 bits) following the first 3 bytes carries
 // the sequence ID. The remaining bits contain the packet payload/body
-fn to_payload(packet: BitArray) -> Result(Payload, ProtocolError) {
+fn to_payload(packet: BitArray) -> Result(Payload, MarineError) {
   case packet {
     <<length:little-size(24), seq_id:little-size(8), rest:bits>> -> {
       Payload(length: length, sequence_id: seq_id, body: rest) |> Ok
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_v10.html
-fn decode_initial_handshake(
-  payload: Payload,
-) -> Result(Handshake, ProtocolError) {
+fn decode_initial_handshake(payload: Payload) -> Result(Handshake, MarineError) {
   case payload.body {
     <<10, rest:bits>> -> decode_handshake_v10(rest)
     <<0xFF, rest:bits>> -> decode_connect_err_packet_body(rest)
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
 fn decode_connect_err_packet_body(
   body: BitArray,
-) -> Result(Handshake, ProtocolError) {
+) -> Result(Handshake, MarineError) {
   case body {
     <<code:unsigned-little-size(16), message:bits>> -> {
       let name = server_errors.to_name(code)
-      ProtocolError(code, name, message) |> Error
+      errors.ProtocolError(code, name, message) |> Error
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
-fn generic_error() -> ProtocolError {
-  ProtocolError(-1, "generic_error", <<>>)
-}
-
-fn decode_handshake_v10(body: BitArray) -> Result(Handshake, ProtocolError) {
+fn decode_handshake_v10(body: BitArray) -> Result(Handshake, MarineError) {
   use #(server_version, rest) <- result.try(null_terminated_string(body))
 
   case rest {
@@ -195,7 +190,7 @@ fn decode_handshake_v10(body: BitArray) -> Result(Handshake, ProtocolError) {
       |> result.then(ensure_capabilities(_, required_capabilities))
       |> result.then(apply_auth_plugin_info(_, auth_plugin_data1, rest))
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
@@ -203,14 +198,14 @@ fn build_capability_flags(
   handshake: Handshake,
   flags1: BitArray,
   flags2: BitArray,
-) -> Result(Handshake, ProtocolError) {
+) -> Result(Handshake, MarineError) {
   let capability_flags = bit_array.concat([flags1, flags2])
 
   case capability_flags {
     <<capability_flags:unsigned-little-size(32)>> -> {
       Handshake(..handshake, capability_flags: capability_flags) |> Ok
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
@@ -218,14 +213,14 @@ fn build_capability_flags(
 fn ensure_capabilities(
   handshake: Handshake,
   required_capabilities: List(String),
-) -> Result(Handshake, ProtocolError) {
+) -> Result(Handshake, MarineError) {
   let has_capabilities =
     required_capabilities
     |> list.all(flags.has_capability_flag(handshake.capability_flags, _))
 
   case has_capabilities {
     True -> Ok(handshake)
-    False -> Error(generic_error())
+    False -> Error(errors.GenericError)
   }
 }
 
@@ -233,7 +228,7 @@ fn apply_auth_plugin_info(
   handshake: Handshake,
   auth_plugin_data1: BitArray,
   data: BitArray,
-) -> Result(Handshake, ProtocolError) {
+) -> Result(Handshake, MarineError) {
   case data {
     <<
       auth_plugin_data_length:unsigned-little-int,
@@ -249,7 +244,7 @@ fn apply_auth_plugin_info(
         Handshake(..handshake, auth_plugin_data: data, auth_plugin_name: name)
       })
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
@@ -257,7 +252,7 @@ fn parse_auth_plugin_info(
   data: BitArray,
   auth_plugin_data1: BitArray,
   len: Int,
-) -> Result(#(String, String), ProtocolError) {
+) -> Result(#(String, String), MarineError) {
   case data {
     <<auth_plugin_data2:bits-size(len), auth_plugin_name:bits>> -> {
       let auth_plugin_data = <<auth_plugin_data1:bits, auth_plugin_data2:bits>>
@@ -267,18 +262,18 @@ fn parse_auth_plugin_info(
 
         Ok(#(plugin_data, plugin_name))
       }
-      result.replace_error(info, generic_error())
+      result.replace_error(info, errors.GenericError)
     }
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
 fn null_terminated_string(
   data: BitArray,
-) -> Result(#(BitArray, BitArray), ProtocolError) {
+) -> Result(#(BitArray, BitArray), MarineError) {
   case erl_binary_split(data, <<0>>) {
     [string, rest] -> Ok(#(string, rest))
-    _ -> Error(generic_error())
+    _ -> Error(errors.GenericError)
   }
 }
 
@@ -352,7 +347,7 @@ pub type Command {
 pub fn encode_command(_command: Command) -> BitArray {
   <<0x01>>
 }
-// pub fn decode_response(payload: BitArray) -> Result(Nil, ProtocolError) {
+// pub fn decode_response(payload: BitArray) -> Result(Nil, MarineError) {
 //   todo
 // }
 // 
@@ -360,10 +355,10 @@ pub fn encode_command(_command: Command) -> BitArray {
 //   <<>>
 // }
 // 
-// pub fn decode_column_def(payload: BitArray) -> Result(Nil, ProtocolError) {
+// pub fn decode_column_def(payload: BitArray) -> Result(Nil, MarineError) {
 //   todo
 // }
 // 
-// pub fn decode_more_results(payload: BitArray) -> Result(Nil, ProtocolError) {
+// pub fn decode_more_results(payload: BitArray) -> Result(Nil, MarineError) {
 //   todo
 // }

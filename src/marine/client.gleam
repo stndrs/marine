@@ -1,4 +1,5 @@
 import gleam/result
+import marine/errors.{type MarineError}
 import marine/protocol.{type Handshake}
 import mug.{type Socket}
 
@@ -11,21 +12,17 @@ pub type Config {
   )
 }
 
-pub type ClientError {
-  ClientError(message: String)
-}
-
 // pub fn new() {
 //   todo
 // }
 
-pub fn connect(config: Config) -> Result(Socket, ClientError) {
+pub fn connect(config: Config) -> Result(Socket, MarineError) {
   let Config(host, port, connect_timeout, _) = config
 
   mug.new(host, port: port)
   |> mug.timeout(connect_timeout)
   |> mug.connect
-  |> result.replace_error(ClientError("Failed to connect"))
+  |> result.replace_error(errors.ClientError("Failed to connect"))
   |> result.then(handshake(_, config))
 }
 
@@ -39,10 +36,10 @@ pub fn connect(config: Config) -> Result(Socket, ClientError) {
 
 // Connect
 
-fn handshake(socket: Socket, config: Config) -> Result(Socket, ClientError) {
+fn handshake(socket: Socket, config: Config) -> Result(Socket, MarineError) {
   socket
   |> mug.receive(config.connect_timeout)
-  |> result.replace_error(ClientError("Failed to receive"))
+  |> result.replace_error(errors.ClientError("Failed to receive"))
   |> result.then(do_handshake(socket, config, _))
 }
 
@@ -50,10 +47,9 @@ fn do_handshake(
   socket: Socket,
   config: Config,
   packet: BitArray,
-) -> Result(Socket, ClientError) {
+) -> Result(Socket, MarineError) {
   packet
   |> protocol.initial_handshake
-  |> result.map_error(fn(err) { ClientError(err.name) })
   |> result.then(do_handshake_response(socket, config, _))
   |> result.map(fn(_) { socket })
 }
@@ -62,7 +58,7 @@ fn do_handshake_response(
   socket: Socket,
   config: Config,
   handshake: Handshake,
-) -> Result(Socket, ClientError) {
+) -> Result(Socket, MarineError) {
   let _int =
     protocol.compile_capability_flags(config.protocol_config, handshake)
   // protocol.maybe_upgrade_to_ssl
