@@ -1,10 +1,12 @@
 import gleam/bit_array
+import gleam/bytes_builder
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/regex
 import gleam/result
 import gleam/string
+import marine/config.{type Config, type SSLRequest, Config, SSLRequest}
 import marine/errors.{type MarineError}
 import marine/flags
 import marine/server_errors
@@ -28,14 +30,6 @@ pub type ServerInfo {
 pub type Vendor {
   MySQL
   MariaDB
-}
-
-pub type SslOpts {
-  SslOpts
-}
-
-pub type Config {
-  Config(database: String, ssl_opts: Option(SslOpts))
 }
 
 pub type Payload {
@@ -66,13 +60,13 @@ pub fn compile_capability_flags(
       string.is_empty(config.database)
     })
     |> maybe_add_capability_flags("client_ssl", fn() {
-      option.is_some(config.ssl_opts)
+      list.is_empty(config.ssl_opts)
     })
 
   let ssl_support_error = case config.ssl_opts {
-    Some(_opts) ->
+    [] -> False
+    _ssl_opts ->
       flags.has_capability_flag(server_capability_flags, "client_ssl")
-    None -> False
   }
 
   case ssl_support_error {
@@ -115,11 +109,66 @@ fn maybe_add_capability_flags(
 // pub fn encode_handshake_response_41() -> Result(Nil, MarineError) {
 //   todo
 // }
-// 
-// pub fn encode_ssl_request() -> Result(Nil, MarineError) {
-//   todo
-// }
-// 
+
+pub fn encode_ssl_request(ssl_request: SSLRequest) -> BitArray {
+  let SSLRequest(capability_flags, charset, max_packet_size) = ssl_request
+
+  <<
+    capability_flags:little-size(32),
+    max_packet_size:little-size(32),
+    charset,
+    0:little-size(23),
+  >>
+}
+
+pub fn encode_packet(
+  payload: BitArray,
+  sequence_id: Int,
+  max_packet_size: Int,
+) -> BitArray {
+  let payload_size = bit_array.byte_size(payload)
+
+  case payload_size > max_packet_size {
+    True -> encode_packets(payload, payload_size, sequence_id, max_packet_size)
+    False -> [
+      <<payload_size:little-size(24), sequence_id:little-int, payload:bits>>,
+    ]
+  }
+  |> bytes_builder.concat_bit_arrays
+  |> bytes_builder.to_bit_array
+}
+
+fn encode_packets(
+  payload: BitArray,
+  payload_size: Int,
+  sequence_id: Int,
+  max_packet_size: Int,
+) -> List(BitArray) {
+  let max_bits = max_packet_size * 8
+
+  case payload {
+    <<new_payload:size(max_bits)-bits, rest:bits>> -> {
+      let remaining_bytes = payload_size - max_packet_size
+      let next_seq_id = case sequence_id < 255 {
+        True -> sequence_id + 1
+        False -> 0
+      }
+
+      [
+        encode_packets(
+          new_payload,
+          max_packet_size,
+          next_seq_id,
+          max_packet_size,
+        ),
+        encode_packets(rest, remaining_bytes, next_seq_id, max_packet_size),
+      ]
+      |> list.flatten
+    }
+    _ -> []
+  }
+}
+
 // pub fn decode_auth_response() -> Result(Nil, MarineError) {
 //   todo
 // }

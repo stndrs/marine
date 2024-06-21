@@ -6,6 +6,9 @@ services:
       MARIADB_ROOT_PASSWORD: mariadb
     ports:
       - 3306:3306
+    # volumes:
+    #   - ./certs:/etc/mysql
+    # command: /etc/mysql/setup.sh
 
   adminer:
     image: adminer
