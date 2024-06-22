@@ -1,11 +1,8 @@
 import gleam/io
-import gleam/option.{None, Some}
 import gleam/result
-import marine/config.{
-  type Config, type SSLOpts, type SSLRequest, Config, SSLRequest,
-}
+import marine/config.{type Config, type SSLRequest, Config, SSLRequest}
 import marine/errors.{type MarineError}
-import marine/protocol.{type Handshake}
+import marine/protocol.{type Handshake, Handshake}
 import mug.{type Socket}
 
 // utf8mb4
@@ -22,7 +19,8 @@ pub type Client {
 // }
 
 pub fn connect(config: Config) -> Result(Client, MarineError) {
-  let Config(host, port, _database, connect_timeout, _) = config
+  let Config(host, port, _database, _username, _password, connect_timeout, _) =
+    config
 
   mug.new(host, port: port)
   |> mug.timeout(connect_timeout)
@@ -43,35 +41,56 @@ pub fn connect(config: Config) -> Result(Client, MarineError) {
 // Connect
 
 fn handshake(client: Client, config: Config) -> Result(Client, MarineError) {
-  client.socket
-  |> mug.receive(config.connect_timeout)
-  |> result.replace_error(errors.ClientError("Failed to receive"))
-  |> result.then(do_handshake(client, config, _))
+  let initial_handshake_result =
+    recv_packet(client, config)
+    |> result.replace_error(errors.ClientError("Failed to receive"))
+    |> result.then(protocol.initial_handshake)
+
+  use handshake <- result.try(initial_handshake_result)
+
+  protocol.compile_capability_flags(handshake, config)
+  |> result.then(maybe_upgrade_to_ssl(client, config, _))
+  |> result.then(build_handshake_response(_, config, handshake))
 }
 
-fn do_handshake(
-  client: Client,
-  config: Config,
-  packet: BitArray,
-) -> Result(Client, MarineError) {
-  packet
-  |> protocol.initial_handshake
-  |> result.then(do_handshake_response(client, config, _))
-}
-
-fn do_handshake_response(
+fn build_handshake_response(
   client: Client,
   config: Config,
   handshake: Handshake,
 ) -> Result(Client, MarineError) {
-  let _int =
-    protocol.compile_capability_flags(config, handshake)
-    |> result.then(maybe_upgrade_to_ssl(client, config, _))
-    |> io.debug
-  // handle_handshake_response
+  let auth_resp =
+    protocol.build_handshake_response(handshake, config)
+    |> result.then(send_packet(client, _, default_max_packet_size))
+    |> result.then(recv_packet(_, config))
+    |> result.then(protocol.handle_auth)
+    |> result.then(protocol.handle_auth_response(config, _))
+
+  use auth_resp <- result.try(auth_resp)
+
+  client
+  |> increment_sequence_id
+  |> increment_sequence_id
+  |> send_packet(auth_resp, default_max_packet_size)
+  |> result.then(recv_packet(_, config))
+  |> result.then(protocol.handle_auth)
+  |> io.debug
+  // protocol.auth_switch_request if needed
+  // senc_packet
+  // recv_packet
+  // perform_full_auth if `full_auth`
+  // perform_public_key_auth else
+  // auth_switch_req
+  // send_recv_packet
+  // more_auth
+  //
   // handle ok_packet
   // handle error_packet
-  Ok(client)
+  |> result.replace(client)
+}
+
+fn recv_packet(client: Client, config: Config) -> Result(BitArray, MarineError) {
+  mug.receive(client.socket, config.connect_timeout)
+  |> result.replace_error(errors.ClientError("Failed to receive"))
 }
 
 fn maybe_upgrade_to_ssl(
@@ -79,6 +98,8 @@ fn maybe_upgrade_to_ssl(
   config: Config,
   capability_flags: Int,
 ) -> Result(Client, MarineError) {
+  let client = increment_sequence_id(client)
+
   case config.ssl_opts {
     [] -> Ok(client)
     ssl_opts -> {

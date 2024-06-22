@@ -1,17 +1,13 @@
-import gleam/option.{type Option}
-
 pub type Config {
   Config(
     host: String,
     port: Int,
     database: String,
+    username: String,
+    password: String,
     connect_timeout: Int,
     ssl_opts: List(#(String, String)),
   )
-}
-
-pub type SSLOpts {
-  SSLOpts(String)
 }
 
 pub type SSLRequest {

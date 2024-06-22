@@ -9,9 +9,11 @@ pub fn main() {
 
 pub fn connect_test() {
   Config(
-    host: "localhost",
+    host: "172.22.0.1",
     port: 3306,
     database: "",
+    username: "mariadb",
+    password: "mariadb_user_pw",
     connect_timeout: 5000,
     ssl_opts: [],
   )
