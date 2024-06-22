@@ -3,9 +3,13 @@ services:
     image: mariadb
     restart: unless-stopped
     environment:
-      MARIADB_ROOT_PASSWORD: mariadb
+      MARIADB_ROOT_PASSWORD: mariadb_root_pw
+      MARIADB_USER: mariadb
+      MARIADB_PASSWORD: mariadb_user_pw
+      MARIADB_DATABASE: marine
     ports:
       - 3306:3306
+    # command: /etc/mysql/setup.sh
 
   adminer:
     image: adminer
