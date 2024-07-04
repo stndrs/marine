@@ -21,8 +21,15 @@ pub type Handshake {
     charset: Int,
     status_flags: Int,
     auth_plugin_data: String,
-    auth_plugin_name: String,
+    auth_plugin_name: AuthPluginName,
   )
+}
+
+pub type AuthPluginName {
+  MySQLClearPassword
+  MySQLNativePassword
+  SHA256Password
+  CachingSHA2Password
 }
 
 type HandshakeResponse {
@@ -55,7 +62,7 @@ pub type AuthResponse {
   AuthResponse(body: BitArray)
   AuthMoreData(data: BitArray)
   AuthError(data: BitArray)
-  AuthSwitchRequest(plugin_name: String, plugin_data: String)
+  AuthSwitchRequest(plugin_name: AuthPluginName, plugin_data: String)
 }
 
 // Connection Phase
@@ -79,7 +86,7 @@ pub fn compile_capability_flags(
     server_capability_flags
     |> flags.put_capability_flag(flags.client_capability_names)
     |> maybe_add_capability_flags("client_connect_with_db", fn() {
-      string.is_empty(config.database)
+      !string.is_empty(config.database)
     })
     |> maybe_add_capability_flags("client_ssl", fn() {
       list.is_empty(config.ssl_opts)
@@ -160,9 +167,14 @@ pub fn handle_auth(packet: BitArray) -> Result(AuthResponse, MarineError) {
     <<0xFE, rest:bits>> -> {
       use #(plugin_name, rest) <- result.try(null_terminated_string(rest))
 
-      bit_array.to_string(rest)
-      |> result.map(AuthSwitchRequest(plugin_name, _))
-      |> result.replace_error(errors.GenericError)
+      let info = {
+        use plugin_name <- result.try(to_auth_plugin_name(plugin_name))
+
+        bit_array.to_string(rest)
+        |> result.map(AuthSwitchRequest(plugin_name, _))
+      }
+
+      info |> result.replace_error(errors.GenericError)
     }
     _ -> {
       Error(errors.GenericError)
@@ -175,10 +187,13 @@ pub fn handle_auth_response(
   resp: AuthResponse,
 ) -> Result(BitArray, MarineError) {
   case resp {
+    FullAuth -> Ok(<<>>)
+    AuthResponse(body) -> Ok(body)
+    AuthMoreData(data) -> Ok(data)
+    AuthError(data) -> Error(errors.ProtocolError(-1, "auth_error", data))
     AuthSwitchRequest(name, data) -> {
       auth_response(config, name, data) |> Ok
     }
-    _ -> Error(errors.GenericError)
   }
 }
 
@@ -384,7 +399,7 @@ fn decode_handshake_v10(body: BitArray) -> Result(Handshake, MarineError) {
         charset: character_set,
         status_flags: status_flags,
         auth_plugin_data: "",
-        auth_plugin_name: "",
+        auth_plugin_name: MySQLClearPassword,
       )
       |> build_capability_flags(capability_flags1, capability_flags2)
       |> result.then(ensure_capabilities(_, required_capabilities))
@@ -452,19 +467,29 @@ fn parse_auth_plugin_info(
   data: BitArray,
   auth_plugin_data1: BitArray,
   len: Int,
-) -> Result(#(String, String), MarineError) {
+) -> Result(#(String, AuthPluginName), MarineError) {
   case data {
     <<auth_plugin_data2:bits-size(len), auth_plugin_name:bits>> -> {
       let auth_plugin_data = <<auth_plugin_data1:bits, auth_plugin_data2:bits>>
       let info = {
         use plugin_data <- result.try(bit_array.to_string(auth_plugin_data))
-        use plugin_name <- result.try(bit_array.to_string(auth_plugin_name))
-
-        Ok(#(plugin_data, plugin_name))
+        bit_array.to_string(auth_plugin_name)
+        |> result.then(to_auth_plugin_name(_))
+        |> result.map(fn(plugin_name) { #(plugin_data, plugin_name) })
       }
       result.replace_error(info, errors.GenericError)
     }
     _ -> Error(errors.GenericError)
+  }
+}
+
+fn to_auth_plugin_name(plugin_name: String) -> Result(AuthPluginName, Nil) {
+  case plugin_name {
+    "mysql_clear_password" -> Ok(MySQLClearPassword)
+    "mysql_native_password" -> Ok(MySQLNativePassword)
+    "sha256_password" -> Ok(SHA256Password)
+    "caching_sha2_password" -> Ok(CachingSHA2Password)
+    _ -> Error(Nil)
   }
 }
 
@@ -583,15 +608,14 @@ fn auth_hash(
 
 pub fn auth_response(
   config: Config,
-  plugin_name: String,
+  plugin_name: AuthPluginName,
   plugin_data: String,
 ) -> BitArray {
   case plugin_name {
-    "mysql_clear_password" -> mysql_clear_password(config, plugin_data)
-    "mysql_native_password" -> mysql_native_password(config, plugin_data)
-    "sha256_password" -> sha256_password(config, plugin_data)
-    "caching_sha2_password" -> sha2_password(config, plugin_data)
-    _ -> <<>>
+    MySQLClearPassword -> mysql_clear_password(config, plugin_data)
+    MySQLNativePassword -> mysql_native_password(config, plugin_data)
+    SHA256Password -> sha256_password(config, plugin_data)
+    CachingSHA2Password -> sha2_password(config, plugin_data)
   }
 }
 
