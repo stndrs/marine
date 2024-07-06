@@ -1,13 +1,19 @@
 import gleam/bit_array
+import gleam/bytes_builder.{type BytesBuilder}
+import gleam/crypto
 import gleam/int
+import gleam/io
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/regex
 import gleam/result
 import gleam/string
+import marine/config.{type Config, type SSLRequest, Config, SSLRequest}
 import marine/errors.{type MarineError}
 import marine/flags
 import marine/server_errors
+
+pub const max_packet_size = 0x00ffffff
 
 pub type Handshake {
   Handshake(
@@ -17,7 +23,26 @@ pub type Handshake {
     charset: Int,
     status_flags: Int,
     auth_plugin_data: String,
-    auth_plugin_name: String,
+    auth_plugin_name: AuthPluginName,
+  )
+}
+
+pub type AuthPluginName {
+  MySQLClearPassword
+  MySQLNativePassword
+  SHA256Password
+  CachingSHA2Password
+}
+
+type HandshakeResponse {
+  HandshakeResponse(
+    client_capability_flags: Int,
+    max_bytes_per_packet: Int,
+    username: BitArray,
+    hash_length: Int,
+    hash: BitArray,
+    database: BitArray,
+    auth_plugin_name: BitArray,
   )
 }
 
@@ -30,16 +55,16 @@ pub type Vendor {
   MariaDB
 }
 
-pub type SslOpts {
-  SslOpts
-}
-
-pub type Config {
-  Config(database: String, ssl_opts: Option(SslOpts))
-}
-
 pub type Payload {
   Payload(length: Int, sequence_id: Int, body: BitArray)
+}
+
+pub type AuthResponse {
+  FullAuth
+  AuthResponse(body: BitArray)
+  AuthMoreData(data: BitArray)
+  AuthError(data: BitArray)
+  AuthSwitchRequest(plugin_name: AuthPluginName, plugin_data: String)
 }
 
 // Connection Phase
@@ -54,8 +79,8 @@ pub fn initial_handshake(packet: BitArray) -> Result(Handshake, MarineError) {
 
 /// Compiles the client's capability flags
 pub fn compile_capability_flags(
-  config: Config,
   initial_handshake: Handshake,
+  config: Config,
 ) -> Result(Int, MarineError) {
   let server_capability_flags = initial_handshake.capability_flags
 
@@ -63,16 +88,16 @@ pub fn compile_capability_flags(
     server_capability_flags
     |> flags.put_capability_flag(flags.client_capability_names)
     |> maybe_add_capability_flags("client_connect_with_db", fn() {
-      string.is_empty(config.database)
+      !string.is_empty(config.database)
     })
     |> maybe_add_capability_flags("client_ssl", fn() {
-      option.is_some(config.ssl_opts)
+      list.is_empty(config.ssl_opts)
     })
 
   let ssl_support_error = case config.ssl_opts {
-    Some(_opts) ->
+    [] -> False
+    _ssl_opts ->
       flags.has_capability_flag(server_capability_flags, "client_ssl")
-    None -> False
   }
 
   case ssl_support_error {
@@ -112,14 +137,202 @@ fn maybe_add_capability_flags(
   }
 }
 
+pub fn build_handshake_response(
+  handshake: Handshake,
+  config: Config,
+) -> Result(BitArray, MarineError) {
+  set_client_capabilities(config)
+  // |> verify_server_capabilities(handshake)
+  |> auth_hash(handshake, config)
+  |> apply_config(config)
+  |> to_response_payload
+  |> Ok
+}
+
+pub fn handle_auth(packet: BitArray) -> Result(AuthResponse, MarineError) {
+  use payload <- result.try(to_payload(packet))
+
+  case payload.body {
+    <<0x00, rest:bits>> -> {
+      Ok(AuthResponse(rest))
+    }
+    <<0xFF, rest:bits>> -> {
+      decode_connect_err_packet_body(rest)
+      |> result.replace(AuthError(rest))
+    }
+    <<0x01, 0x04>> -> {
+      Ok(FullAuth)
+    }
+    <<0x01, rest:bits>> -> {
+      Ok(AuthMoreData(rest))
+    }
+    <<0xFE, rest:bits>> -> {
+      use #(plugin_name, rest) <- result.try(null_terminated_string(rest))
+
+      let info = {
+        use plugin_name <- result.try(to_auth_plugin_name(plugin_name))
+
+        bit_array.to_string(rest)
+        |> result.map(AuthSwitchRequest(plugin_name, _))
+      }
+
+      info |> result.replace_error(errors.GenericError)
+    }
+    _ -> {
+      Error(errors.GenericError)
+    }
+  }
+}
+
+pub fn handle_auth_response(
+  config: Config,
+  resp: AuthResponse,
+) -> Result(BitArray, MarineError) {
+  io.debug(resp)
+  case resp {
+    FullAuth -> Ok(<<>>)
+    AuthResponse(body) -> Ok(body)
+    AuthMoreData(data) -> Ok(data)
+    AuthError(data) -> Error(errors.ProtocolError(-1, "auth_error", data))
+    AuthSwitchRequest(name, data) -> {
+      auth_response(config, name, data) |> Ok
+    }
+  }
+}
+
+pub fn auth_switch_request() {
+  Nil
+}
+
+fn to_response_payload(response: HandshakeResponse) -> BitArray {
+  let HandshakeResponse(flags, max_bytes, user, hash_len, hash, db, plugin_name) =
+    response
+
+  let charset = 45
+  <<
+    flags:little-size(32),
+    max_bytes:little-size(32),
+    charset,
+    0:unit(23)-size(8),
+    user:bits,
+    0,
+    hash_len,
+    hash:bits,
+    db:bits,
+    plugin_name:bits,
+    0,
+  >>
+}
+
+fn verify_server_capabilities(
+  response: HandshakeResponse,
+  handshake: Handshake,
+) -> Result(HandshakeResponse, MarineError) {
+  case
+    int.bitwise_and(
+      handshake.capability_flags,
+      response.client_capability_flags,
+    )
+    == response.client_capability_flags
+  {
+    True -> Ok(response)
+    False -> Error(errors.ProtocolError(-1, "", <<>>))
+  }
+}
+
+fn apply_config(
+  response: HandshakeResponse,
+  config: Config,
+) -> HandshakeResponse {
+  let username = string_to_bit_array(config.username)
+  let database = string_to_bit_array(config.database)
+
+  HandshakeResponse(..response, username: username, database: database)
+}
+
+fn string_to_bit_array(value: String) -> BitArray {
+  bytes_builder.from_string(value)
+  |> bytes_builder.to_bit_array
+}
+
+fn set_client_capabilities(config: Config) -> HandshakeResponse {
+  let flags_0 =
+    flags.put_capability_flag(0, [
+      "client_protocol_41", "client_transactions", "client_secure_connection",
+    ])
+
+  let flags_1 = case config.database {
+    "" -> flags_0
+    _ -> flags.put_capability_flag(flags_0, ["client_connect_with_db"])
+  }
+
+  let flags_2 =
+    flags.put_capability_flag(flags_1, [
+      "client_multi_statements", "client_multi_results", "client_plugin_auth",
+    ])
+  // case set_found_rows
+
+  HandshakeResponse(flags_2, 0, <<>>, 0, <<>>, <<>>, <<>>)
+}
+
 // pub fn encode_handshake_response_41() -> Result(Nil, MarineError) {
 //   todo
 // }
-// 
-// pub fn encode_ssl_request() -> Result(Nil, MarineError) {
-//   todo
-// }
-// 
+
+pub fn encode_ssl_request(ssl_request: SSLRequest) -> BitArray {
+  let SSLRequest(capability_flags, charset, max_packet_size) = ssl_request
+
+  <<
+    capability_flags:little-size(32),
+    max_packet_size:little-size(32),
+    charset,
+    0:little-size(23),
+  >>
+}
+
+pub type Packet {
+  Packet(payload_length: Int, sequence_id: Int, payload: BitArray)
+}
+
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html
+// max_packet_size is the maximum packet size in bytes
+pub fn encode_packet(
+  payload: BitArray,
+  seq_id: Int,
+  max_packet_size: Int,
+) -> #(List(BytesBuilder), Int) {
+  let payload_size = bit_array.byte_size(payload)
+  let max_bits = max_packet_size * 8
+  let next_seq_id = int.bitwise_and(seq_id + 1, 0xFF)
+
+  case payload {
+    _ if payload_size == 0 -> {
+      #([], seq_id)
+    }
+    payload if payload_size < max_packet_size -> {
+      let header = <<payload_size:little-int-size(24), seq_id:little-int>>
+
+      let builder =
+        bytes_builder.from_bit_array(header)
+        |> bytes_builder.append(payload)
+
+      #([builder], next_seq_id)
+    }
+    <<payload:bits-size(max_bits), rest:bits>> -> {
+      let #(packets, next_seq_id_1) =
+        encode_packet(rest, next_seq_id, max_packet_size)
+      let header = <<max_packet_size:little-int-size(24), seq_id:little-int>>
+
+      let builder =
+        bytes_builder.from_bit_array(header)
+        |> bytes_builder.append(payload)
+
+      #([builder, ..packets], next_seq_id_1)
+    }
+    _ -> #([], seq_id)
+  }
+}
+
 // pub fn decode_auth_response() -> Result(Nil, MarineError) {
 //   todo
 // }
@@ -184,7 +397,7 @@ fn decode_handshake_v10(body: BitArray) -> Result(Handshake, MarineError) {
         charset: character_set,
         status_flags: status_flags,
         auth_plugin_data: "",
-        auth_plugin_name: "",
+        auth_plugin_name: MySQLClearPassword,
       )
       |> build_capability_flags(capability_flags1, capability_flags2)
       |> result.then(ensure_capabilities(_, required_capabilities))
@@ -252,15 +465,15 @@ fn parse_auth_plugin_info(
   data: BitArray,
   auth_plugin_data1: BitArray,
   len: Int,
-) -> Result(#(String, String), MarineError) {
+) -> Result(#(String, AuthPluginName), MarineError) {
   case data {
     <<auth_plugin_data2:bits-size(len), auth_plugin_name:bits>> -> {
       let auth_plugin_data = <<auth_plugin_data1:bits, auth_plugin_data2:bits>>
       let info = {
         use plugin_data <- result.try(bit_array.to_string(auth_plugin_data))
-        use plugin_name <- result.try(bit_array.to_string(auth_plugin_name))
-
-        Ok(#(plugin_data, plugin_name))
+        bit_array.to_string(auth_plugin_name)
+        |> result.then(to_auth_plugin_name(_))
+        |> result.map(fn(plugin_name) { #(plugin_data, plugin_name) })
       }
       result.replace_error(info, errors.GenericError)
     }
@@ -268,11 +481,26 @@ fn parse_auth_plugin_info(
   }
 }
 
+fn to_auth_plugin_name(plugin_name: String) -> Result(AuthPluginName, Nil) {
+  // Not sure why I can't match on exact strings
+  case plugin_name {
+    "mysql_clear_password" <> _ -> Ok(MySQLClearPassword)
+    "mysql_native_password" <> _ -> Ok(MySQLNativePassword)
+    "sha256_password" <> _ -> Ok(SHA256Password)
+    "caching_sha2_password" <> _ -> Ok(CachingSHA2Password)
+    _ -> Error(Nil)
+  }
+}
+
 fn null_terminated_string(
   data: BitArray,
-) -> Result(#(BitArray, BitArray), MarineError) {
+) -> Result(#(String, BitArray), MarineError) {
   case erl_binary_split(data, <<0>>) {
-    [string, rest] -> Ok(#(string, rest))
+    [string, rest] -> {
+      bit_array.to_string(string)
+      |> result.replace_error(errors.ProtocolError(-1, "", <<>>))
+      |> result.map(fn(str) { #(str, rest) })
+    }
     _ -> Error(errors.GenericError)
   }
 }
@@ -281,9 +509,9 @@ fn null_terminated_string(
 fn erl_binary_split(input: BitArray, pattern: BitArray) -> List(BitArray)
 
 // Ported from https://github.com/mysql-otp/mysql-otp/blob/b97ef3dc1313b2e94ed489f41d735b8e4f769459/src/mysql_protocol.erl#L379
-fn to_server_info(server_version: BitArray) -> ServerInfo {
+fn to_server_info(server_version: String) -> ServerInfo {
   case server_version {
-    <<"5.5.5-":utf8, rest:bits>> -> {
+    "5.5.5-" <> rest -> {
       ServerInfo(vendor: MariaDB, version: server_version_to_list(rest))
     }
     _ -> {
@@ -300,10 +528,8 @@ fn to_server_info(server_version: BitArray) -> ServerInfo {
   }
 }
 
-fn server_version_to_list(version: BitArray) -> List(Int) {
+fn server_version_to_list(version: String) -> List(Int) {
   let version_list = {
-    use version <- result.try(bit_array.to_string(version))
-
     regex.from_string("^(\\d+)\\.(\\d+)\\.(\\d+)")
     |> result.nil_error
     |> result.map(fn(regex) {
@@ -347,6 +573,7 @@ pub type Command {
 pub fn encode_command(_command: Command) -> BitArray {
   <<0x01>>
 }
+
 // pub fn decode_response(payload: BitArray) -> Result(Nil, MarineError) {
 //   todo
 // }
@@ -362,3 +589,111 @@ pub fn encode_command(_command: Command) -> BitArray {
 // pub fn decode_more_results(payload: BitArray) -> Result(Nil, MarineError) {
 //   todo
 // }
+
+///  Auth
+fn auth_hash(
+  response: HandshakeResponse,
+  handshake: Handshake,
+  config: Config,
+) -> HandshakeResponse {
+  let plugin_name = handshake.auth_plugin_name
+  let plugin_data = handshake.auth_plugin_data
+
+  let hash = auth_response(config, plugin_name, plugin_data)
+  let hash_length = bit_array.byte_size(hash)
+
+  HandshakeResponse(..response, hash: hash, hash_length: hash_length)
+}
+
+pub fn auth_response(
+  config: Config,
+  plugin_name: AuthPluginName,
+  plugin_data: String,
+) -> BitArray {
+  case plugin_name {
+    MySQLClearPassword -> mysql_clear_password(config, plugin_data)
+    MySQLNativePassword -> mysql_native_password(config, plugin_data)
+    SHA256Password -> sha256_password(config, plugin_data)
+    CachingSHA2Password -> sha2_password(config, plugin_data)
+  }
+}
+
+fn mysql_clear_password(_config: Config, _auth_plugin_data: String) -> BitArray {
+  <<>>
+}
+
+fn mysql_native_password(config: Config, auth_plugin_data: String) -> BitArray {
+  let _pw_sha = crypto.hash(crypto.Sha1, <<config.password:utf8>>)
+  // left
+  let pw_hash =
+    bit_array.from_string(config.password)
+    |> crypto.hash(crypto.Sha1, _)
+
+  // right
+  let salt = bit_array.from_string(auth_plugin_data)
+
+  bit_array.byte_size(salt)
+
+  let pw_hash_hash = crypto.hash(crypto.Sha1, pw_hash)
+
+  let right =
+    bytes_builder.from_bit_array(salt)
+    |> bytes_builder.append(pw_hash_hash)
+    |> bytes_builder.to_bit_array
+    |> crypto.hash(crypto.Sha1, _)
+
+  case pw_hash, right {
+    <<left:int-size(160)>>, <<right:int-size(160)>> -> {
+      <<int.bitwise_exclusive_or(left, right):int-size(160)>>
+    }
+    _, _ -> <<>>
+  }
+  // io.debug(1)
+  // let hash_1 =
+  //   crypto.hash(crypto.Sha1, <<config.password:utf8>>)
+  //   |> io.debug
+
+  // let hash_2 = crypto.hash(crypto.Sha1, hash_1)
+
+  // case hash_1, hash_2 {
+  //   <<hsh_1:int-size(160)>>, <<hsh_2:int-size(160)>> -> {
+  //     io.debug(3)
+  //     let hash_3 =
+  //       crypto.hash(crypto.Sha1, <<auth_plugin_data:utf8, hsh_2>>)
+  //       |> io.debug
+
+  //     case hash_3 {
+  //       <<hsh_3:int-size(160)>> -> {
+  //         io.debug(04)
+  //         <<int.bitwise_exclusive_or(hsh_1, hsh_3):int-size(160)>>
+  //         |> io.debug
+  //       }
+  //       _ -> <<>>
+  //     }
+  //   }
+  //   _, _ -> <<>>
+  // }
+  // |> io.debug
+  // let right =
+  //   crypto.hash(crypto.Sha1, <<
+  //     bit_array.from_string(auth_plugin_data):bits,
+  //     crypto.hash(crypto.Sha1, pw_sha):bits,
+  //   >>)
+
+  // case pw_sha, right {
+  //   <<left:int-size(160)>>, <<right:int-size(160)>> -> {
+  //     io.debug(14)
+  //     <<int.bitwise_exclusive_or(left, right):int-size(160)>>
+  //     |> io.debug
+  //   }
+  //   _, _ -> <<>>
+  // }
+}
+
+fn sha256_password(_config: Config, _auth_plugin_data: String) -> BitArray {
+  <<>>
+}
+
+fn sha2_password(_config: Config, _auth_plugin_data: String) -> BitArray {
+  <<>>
+}
