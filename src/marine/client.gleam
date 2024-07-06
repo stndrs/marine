@@ -1,4 +1,7 @@
+import gleam/bit_array
+import gleam/bytes_builder
 import gleam/io
+import gleam/list
 import gleam/result
 import marine/config.{type Config, type SSLRequest, Config, SSLRequest}
 import marine/errors.{type MarineError}
@@ -25,7 +28,7 @@ pub fn connect(config: Config) -> Result(Client, MarineError) {
   mug.new(host, port: port)
   |> mug.timeout(connect_timeout)
   |> mug.connect
-  |> result.map(Client(_, 0))
+  |> result.map(Client(_, 1))
   |> result.replace_error(errors.ClientError("Failed to connect"))
   |> result.then(handshake(_, config))
 }
@@ -50,30 +53,33 @@ fn handshake(client: Client, config: Config) -> Result(Client, MarineError) {
 
   protocol.compile_capability_flags(handshake, config)
   |> result.then(maybe_upgrade_to_ssl(client, config, _))
-  |> result.then(build_handshake_response(_, config, handshake))
+  |> result.then(handshake_response(_, config, handshake))
 }
 
-fn build_handshake_response(
+fn handshake_response(
   client: Client,
   config: Config,
   handshake: Handshake,
 ) -> Result(Client, MarineError) {
-  let auth_resp =
+  let client_result =
     protocol.build_handshake_response(handshake, config)
-    |> result.then(send_packet(client, _, default_max_packet_size))
-    |> result.then(recv_packet(_, config))
+    |> result.then(send_packet(client, _))
+
+  use client <- result.try(client_result)
+
+  let auth_resp =
+    recv_packet(client, config)
     |> result.then(protocol.handle_auth)
     |> result.then(protocol.handle_auth_response(config, _))
 
   use auth_resp <- result.try(auth_resp)
 
+  auth_resp |> bit_array.inspect |> io.debug
+
   client
-  |> increment_sequence_id
-  |> increment_sequence_id
-  |> send_packet(auth_resp, default_max_packet_size)
+  |> send_packet(auth_resp)
   |> result.then(recv_packet(_, config))
   |> result.then(protocol.handle_auth)
-  |> io.debug
   // protocol.auth_switch_request if needed
   // senc_packet
   // recv_packet
@@ -98,8 +104,6 @@ fn maybe_upgrade_to_ssl(
   config: Config,
   capability_flags: Int,
 ) -> Result(Client, MarineError) {
-  let client = increment_sequence_id(client)
-
   case config.ssl_opts {
     [] -> Ok(client)
     ssl_opts -> {
@@ -111,26 +115,29 @@ fn maybe_upgrade_to_ssl(
         )
 
       protocol.encode_ssl_request(ssl_request)
-      |> send_packet(client, _, ssl_request.max_packet_size)
+      |> send_packet(client, _)
       |> result.then(ssl_connect(_, ssl_opts, config.connect_timeout))
-      |> result.map(increment_sequence_id)
     }
   }
 }
 
-fn increment_sequence_id(client: Client) -> Client {
-  Client(..client, sequence_id: client.sequence_id + 1)
-}
+fn send_packet(client: Client, payload: BitArray) -> Result(Client, MarineError) {
+  let #(packets, seq_id) =
+    protocol.encode_packet(
+      payload,
+      client.sequence_id,
+      protocol.max_packet_size,
+    )
 
-fn send_packet(
-  client: Client,
-  payload: BitArray,
-  max_packet_size: Int,
-) -> Result(Client, MarineError) {
-  protocol.encode_packet(payload, client.sequence_id, max_packet_size)
-  |> mug.send(client.socket, _)
+  packets
+  |> list.try_map(fn(packet) {
+    let ba = bytes_builder.to_bit_array(packet)
+    bit_array.inspect(ba) |> io.debug
+
+    mug.send(client.socket, ba)
+  })
   |> result.map_error(fn(_err) { errors.ClientError("Send error") })
-  |> result.replace(client)
+  |> result.map(fn(_) { Client(..client, sequence_id: seq_id) })
 }
 
 fn ssl_connect(

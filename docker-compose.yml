@@ -3,16 +3,22 @@ services:
     image: mariadb
     restart: unless-stopped
     environment:
-      MARIADB_ROOT_PASSWORD: mariadb_root_pw
-      MARIADB_USER: mariadb
-      MARIADB_PASSWORD: mariadb_user_pw
+      MARIADB_ROOT_PASSWORD: maria_root_pw
+      MARIADB_USER: maria
+      MARIADB_PASSWORD: maria_user_pw
       MARIADB_DATABASE: marine
-    ports:
-      - 33066:3306
+    network_mode: host
+    command: --default-authentication-plugin=mysql_native_password --skip-grant-tables
+    volumes:
+      - db:/var/lib/mysql
+    # ports:
+    #   - 33066:3306
     # command: /etc/mysql/setup.sh
 
   adminer:
     image: adminer
     restart: unless-stopped
-    ports:
-      - 8080:8080
+    network_mode: host
+
+volumes:
+  db:

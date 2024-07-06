@@ -1,5 +1,5 @@
 import gleam/bit_array
-import gleam/bytes_builder
+import gleam/bytes_builder.{type BytesBuilder}
 import gleam/crypto
 import gleam/int
 import gleam/io
@@ -12,6 +12,8 @@ import marine/config.{type Config, type SSLRequest, Config, SSLRequest}
 import marine/errors.{type MarineError}
 import marine/flags
 import marine/server_errors
+
+pub const max_packet_size = 0x00ffffff
 
 pub type Handshake {
   Handshake(
@@ -186,6 +188,7 @@ pub fn handle_auth_response(
   config: Config,
   resp: AuthResponse,
 ) -> Result(BitArray, MarineError) {
+  io.debug(resp)
   case resp {
     FullAuth -> Ok(<<>>)
     AuthResponse(body) -> Ok(body)
@@ -198,7 +201,7 @@ pub fn handle_auth_response(
 }
 
 pub fn auth_switch_request() {
-  todo
+  Nil
 }
 
 fn to_response_payload(response: HandshakeResponse) -> BitArray {
@@ -287,51 +290,46 @@ pub fn encode_ssl_request(ssl_request: SSLRequest) -> BitArray {
   >>
 }
 
-pub fn encode_packet(
-  payload: BitArray,
-  sequence_id: Int,
-  max_packet_size: Int,
-) -> BitArray {
-  let payload_size = bit_array.byte_size(payload)
-
-  case payload_size > max_packet_size {
-    True -> encode_packets(payload, payload_size, sequence_id, max_packet_size)
-    False -> [
-      <<payload_size:little-size(24), sequence_id:little-int, payload:bits>>,
-    ]
-  }
-  |> bytes_builder.concat_bit_arrays
-  |> bytes_builder.to_bit_array
+pub type Packet {
+  Packet(payload_length: Int, sequence_id: Int, payload: BitArray)
 }
 
-fn encode_packets(
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_packets.html
+// max_packet_size is the maximum packet size in bytes
+pub fn encode_packet(
   payload: BitArray,
-  payload_size: Int,
-  sequence_id: Int,
+  seq_id: Int,
   max_packet_size: Int,
-) -> List(BitArray) {
+) -> #(List(BytesBuilder), Int) {
+  let payload_size = bit_array.byte_size(payload)
   let max_bits = max_packet_size * 8
+  let next_seq_id = int.bitwise_and(seq_id + 1, 0xFF)
 
   case payload {
-    <<new_payload:size(max_bits)-bits, rest:bits>> -> {
-      let remaining_bytes = payload_size - max_packet_size
-      let next_seq_id = case sequence_id < 255 {
-        True -> sequence_id + 1
-        False -> 0
-      }
-
-      [
-        encode_packets(
-          new_payload,
-          max_packet_size,
-          next_seq_id,
-          max_packet_size,
-        ),
-        encode_packets(rest, remaining_bytes, next_seq_id, max_packet_size),
-      ]
-      |> list.flatten
+    _ if payload_size == 0 -> {
+      #([], seq_id)
     }
-    _ -> []
+    payload if payload_size < max_packet_size -> {
+      let header = <<payload_size:little-int-size(24), seq_id:little-int>>
+
+      let builder =
+        bytes_builder.from_bit_array(header)
+        |> bytes_builder.append(payload)
+
+      #([builder], next_seq_id)
+    }
+    <<payload:bits-size(max_bits), rest:bits>> -> {
+      let #(packets, next_seq_id_1) =
+        encode_packet(rest, next_seq_id, max_packet_size)
+      let header = <<max_packet_size:little-int-size(24), seq_id:little-int>>
+
+      let builder =
+        bytes_builder.from_bit_array(header)
+        |> bytes_builder.append(payload)
+
+      #([builder, ..packets], next_seq_id_1)
+    }
+    _ -> #([], seq_id)
   }
 }
 
@@ -484,11 +482,12 @@ fn parse_auth_plugin_info(
 }
 
 fn to_auth_plugin_name(plugin_name: String) -> Result(AuthPluginName, Nil) {
+  // Not sure why I can't match on exact strings
   case plugin_name {
-    "mysql_clear_password" -> Ok(MySQLClearPassword)
-    "mysql_native_password" -> Ok(MySQLNativePassword)
-    "sha256_password" -> Ok(SHA256Password)
-    "caching_sha2_password" -> Ok(CachingSHA2Password)
+    "mysql_clear_password" <> _ -> Ok(MySQLClearPassword)
+    "mysql_native_password" <> _ -> Ok(MySQLNativePassword)
+    "sha256_password" <> _ -> Ok(SHA256Password)
+    "caching_sha2_password" <> _ -> Ok(CachingSHA2Password)
     _ -> Error(Nil)
   }
 }
@@ -619,34 +618,82 @@ pub fn auth_response(
   }
 }
 
-fn mysql_clear_password(config: Config, auth_plugin_data: String) -> BitArray {
+fn mysql_clear_password(_config: Config, _auth_plugin_data: String) -> BitArray {
   <<>>
 }
 
 fn mysql_native_password(config: Config, auth_plugin_data: String) -> BitArray {
-  let pw_sha = crypto.hash(crypto.Sha1, <<config.password:utf8>>)
+  let _pw_sha = crypto.hash(crypto.Sha1, <<config.password:utf8>>)
+  // left
+  let pw_hash =
+    bit_array.from_string(config.password)
+    |> crypto.hash(crypto.Sha1, _)
+
+  // right
+  let salt = bit_array.from_string(auth_plugin_data)
+
+  bit_array.byte_size(salt)
+
+  let pw_hash_hash = crypto.hash(crypto.Sha1, pw_hash)
 
   let right =
-    crypto.hash(crypto.Sha1, <<
-      bit_array.from_string(auth_plugin_data):bits,
-      crypto.hash(crypto.Sha1, pw_sha):bits,
-    >>)
+    bytes_builder.from_bit_array(salt)
+    |> bytes_builder.append(pw_hash_hash)
+    |> bytes_builder.to_bit_array
+    |> crypto.hash(crypto.Sha1, _)
 
-  case pw_sha, right {
+  case pw_hash, right {
     <<left:int-size(160)>>, <<right:int-size(160)>> -> {
       <<int.bitwise_exclusive_or(left, right):int-size(160)>>
     }
-    <<left:int-size(256)>>, <<right:int-size(256)>> -> {
-      <<int.bitwise_exclusive_or(left, right):int-size(256)>>
-    }
     _, _ -> <<>>
   }
+  // io.debug(1)
+  // let hash_1 =
+  //   crypto.hash(crypto.Sha1, <<config.password:utf8>>)
+  //   |> io.debug
+
+  // let hash_2 = crypto.hash(crypto.Sha1, hash_1)
+
+  // case hash_1, hash_2 {
+  //   <<hsh_1:int-size(160)>>, <<hsh_2:int-size(160)>> -> {
+  //     io.debug(3)
+  //     let hash_3 =
+  //       crypto.hash(crypto.Sha1, <<auth_plugin_data:utf8, hsh_2>>)
+  //       |> io.debug
+
+  //     case hash_3 {
+  //       <<hsh_3:int-size(160)>> -> {
+  //         io.debug(04)
+  //         <<int.bitwise_exclusive_or(hsh_1, hsh_3):int-size(160)>>
+  //         |> io.debug
+  //       }
+  //       _ -> <<>>
+  //     }
+  //   }
+  //   _, _ -> <<>>
+  // }
+  // |> io.debug
+  // let right =
+  //   crypto.hash(crypto.Sha1, <<
+  //     bit_array.from_string(auth_plugin_data):bits,
+  //     crypto.hash(crypto.Sha1, pw_sha):bits,
+  //   >>)
+
+  // case pw_sha, right {
+  //   <<left:int-size(160)>>, <<right:int-size(160)>> -> {
+  //     io.debug(14)
+  //     <<int.bitwise_exclusive_or(left, right):int-size(160)>>
+  //     |> io.debug
+  //   }
+  //   _, _ -> <<>>
+  // }
 }
 
-fn sha256_password(config: Config, auth_plugin_data: String) -> BitArray {
+fn sha256_password(_config: Config, _auth_plugin_data: String) -> BitArray {
   <<>>
 }
 
-fn sha2_password(config: Config, auth_plugin_data: String) -> BitArray {
+fn sha2_password(_config: Config, _auth_plugin_data: String) -> BitArray {
   <<>>
 }
